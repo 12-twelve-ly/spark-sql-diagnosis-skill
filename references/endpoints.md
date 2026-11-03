@@ -48,3 +48,31 @@
 - Spark 2.4：`/sql` 有，但节点 metrics 很少；task 指标字段名与 3.x 有差异。
 - Spark 3.x：SQL 节点 metrics 完整；AQE Final Plan 可在 `/sql/{id}` 的 `planDescription` 或驱动日志里看到。
 - REST 时间通常为 `2026-11-02T08:06:50.516GMT`；日志时间是本地时区，注意换算。
+
+## Stage attempts
+
+`/stages` 对同一个 `stageId` 可能返回多个 attempt：
+
+- 唯一键是 `(stageId, attemptId)`，不是 `stageId`；
+- 失败重试时会有 `attemptId=0,1,...`；
+- 取 task list 必须带 attempt：
+  `/stages/{stageId}/{attemptId}/taskList`
+- 分析时要保留所有 attempt，不能用一个字典按 `stageId` 覆盖。
+
+## Executor 与 Job
+
+- `/jobs/{jobId}` 返回 `stageIds`；用它可以只抓该 SQL 相关的 stage；
+- `/executors` 返回当前注册的 executor；动态分配释放后可能只剩 driver；
+- 历史 executor 可从 task 的 `executorId` / `host` 还原；
+- `/environment` 里找 `spark.dynamicAllocation.maxExecutors`、
+  `spark.executor.instances`、`spark.executor.cores`。
+
+## 计划节点里的 stage
+
+SQL 页面节点 metrics 的字符串可能包含：
+
+```text
+3.2 s (1.5 s, 1.7 s, 1.7 s (stage 32.0: task 32))
+```
+
+用正则 `stage (\d+)\.(\d+)` 提取 stage id，建立 stage → 计划节点映射。

@@ -2,6 +2,14 @@
 
 只读的 Spark SQL 诊断 skill：给 SQL、`EXPLAIN FORMATTED`、Kyuubi/Spark Driver 日志和 Spark UI 地址，定位慢查询、数据倾斜、spill、冷启动和配置问题。
 
+v2 增加了 Stage 慢因分类：
+
+- 数据倾斜 / map 端倾斜 / 单 task 过重 / shuffle fetch / 并行度与资源；
+- executor 数、maxExecutors、task launch 间隔；
+- Stage → SQL 计划节点映射；
+- 小文件、分区裁剪、stage 重试、Window/动态分区风险；
+- 带适用条件和约束的解法建议。
+
 ## 安装
 
 把整个目录复制到用户级 skill 目录：
@@ -60,6 +68,11 @@ python -m unittest discover -s tests -v
 - SortMergeJoin 单 key 倾斜：识别 44.6x records 倾斜、192MiB spill、冷启动干扰；
 - `count(DISTINCT)` 两阶段去重：不误判为倾斜；
 - 普通 `GROUP BY` + 冷启动：识别 8.45s task 启动延迟和 8192 分区过量；
+- maxExecutors 上限 vs 队列资源不足的区分；
+- map 端输入倾斜、shuffle fetch 慢；
+- 小文件扫描和分区裁剪；
+- stage 失败重试；
+- Window 热点风险和单阶段 distinct 风险；
 - URL 解析、单位解析、日志解析。
 
 ## 文件

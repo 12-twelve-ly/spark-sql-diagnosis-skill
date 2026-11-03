@@ -83,3 +83,74 @@
 4. 冷启动 → 热 executor / 固定 executor；
 5. 分区过量 → 降低初始分区数，保留 AQE；
 6. 不要只打开 AQE 就期待修复可压缩热点。
+
+## Stage 慢因判定顺序
+
+先看 task 分布，再看资源，再看计划：
+
+1. **数据倾斜**：max records / duration 远大于中位数，最大 task 占比高；
+2. **map 端倾斜**：map 阶段 input records / bytes 分布不均，常见于不可切分文件、
+   大量小文件、异常宽记录；
+3. **单 task 过重**：task 均衡但单 task 输入行数/字节过大，整体都慢；
+4. **shuffle fetch 慢**：fetchWait / remote reqs 占 task 时间比例高，上游 task 多
+   或 block 太小；
+5. **并行度受限**：
+   - executor 数接近 maxExecutors，task launch 间隔大 → 被上限卡住；
+   - executor 数低于上限或申请不到资源 → 队列/集群资源不足；
+6. **调度/冷启动**：stage 墙钟远大于最长 task，launch delay 高；
+7. **stage 重试/失败**：失败 attempt、fetch failure、节点异常。
+
+默认阈值（可在代码里调）：
+
+- 倾斜：records ≥5x、duration ≥3x、最大 task 占比 ≥20%；
+- 并行度：task ≥50、launch p90-p10 ≥2s；
+- 单 task 过重：中位输入 >1000 万行或 >512MB；
+- fetch：fetchWait 或 remote reqs 占 task 总时长 ≥20%；
+- 小文件：文件数 ≥100 且平均 <64MB；
+- job/stage 过多：job >20 或 stage >50。
+
+## SQL 与 Stage 映射
+
+- 每个 shuffle 算子（group by、join、distinct、repartition、window、order by）
+  都会切出 stage 边界；
+- 边界前是 map/write，边界后是 reduce/read；
+- 计划节点的 metrics 里常带 `(stage X.Y: task N)`，可据此建立 stage → 节点的映射；
+- Exchange 的 hash key 通常就是 group by / join 的 key；
+- 报告应写出“Stage 37 → SortMergeJoin / Exchange(item_id)”，而不是只说
+  “某个 stage 慢”。
+
+## 解法矩阵
+
+| 场景 | 首选 | 约束/风险 |
+|---|---|---|
+| 大表 join 小表 | 广播/map join | left join 只能广播右表，right join 只能广播左表，full join 不适用；小表压缩后解压可能膨胀，注意 executor 内存 |
+| 大表 join 大表，少量 hot key | 拆出 hot key，hot 侧广播，非 hot 侧正常 join，再 union | 只适合少量热点；热点值要能提前识别 |
+| 大表 join 大表，大量 hot key | 随机前缀 + 膨胀另一侧 | 内存开销大，属于缓解 |
+| null 值倾斜 | 空值加随机后缀，保持不匹配语义 | 不要破坏 left join 语义 |
+| group by 倾斜 | 两阶段聚合：hot key 加盐，局部聚合，去盐再聚合 | 盐值常用 50–100；纯 rand() 会把所有 key 打散，不利于一次聚合 |
+| count(distinct) | 先确认计划；必要时改成 group by 子查询再 count/sum | 两阶段 distinct 不一定倾斜；改写要注意 null 和重复值 |
+| Window TopN | 两阶段 ROW_NUMBER：先按 key+随机分片取 TopN，再全局取 TopN | 多一次聚合，SQL 更复杂 |
+| 动态分区写倾斜 | 按分区键 distribute/repartition，控制并发 | 避免 n×m 小文件；调整分区策略会影响下游 |
+| map 端倾斜 | 合并小文件、改用可切分格式、repartition | 改格式/合并会影响上游写入链路 |
+| filter/flatMap 后不均 | repartition | 非 shuffle 算子也可能造成分区不均 |
+| 并行度不足 | 提高 shuffle 分区数 | 只能缓解，不能拆分单个 hot key |
+
+## 验证 SQL
+
+```sql
+-- 热点 key
+SELECT key, count(*) AS cnt
+FROM table_name
+GROUP BY key
+ORDER BY cnt DESC
+LIMIT 20;
+
+-- 空值
+SELECT count(*) FROM table_name WHERE key IS NULL;
+
+-- 超过阈值的 hot key
+SELECT key, count(*) AS cnt
+FROM table_name
+GROUP BY key
+HAVING count(*) > 1000000;
+```

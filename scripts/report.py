@@ -11,6 +11,11 @@ SEVERITY_LABEL = {
     "INFO": "提示",
 }
 
+CAUSE_TYPES = {
+    "data_skew", "map_side_skew", "task_too_heavy", "shuffle_fetch_slow",
+    "parallelism_cap", "resource_shortage", "scheduling", "stage_retry",
+}
+
 
 def fmt_bytes(value: Any) -> str:
     if value is None:
@@ -68,19 +73,38 @@ def format_evidence(evidence: dict[str, Any]) -> str:
         ("maxRecordsRatio", "max records ratio"),
         ("distinct", "distinct"),
         ("partialAggregation", "partial agg"),
+        ("launchSpreadMs", "launch spread"),
+        ("inputRatio", "input ratio"),
+        ("inputShare", "input share"),
+        ("maxInputRecords", "max input records"),
+        ("medianInputRecords", "median input records"),
+        ("medianInputBytes", "median input bytes"),
+        ("fetchRatio", "fetch ratio"),
+        ("remoteReqsRatio", "remote reqs ratio"),
+        ("upstreamTasks", "shuffle records"),
+        ("executorCount", "executor count"),
+        ("maxExecutors", "max executors"),
+        ("jobCount", "jobs"),
+        ("stageCount", "stages"),
+        ("files", "files"),
+        ("avgFileSize", "avg file size"),
+        ("taskCount", "tasks"),
     ]
     parts = []
     for key, label in keys:
         if key not in evidence or evidence[key] is None:
             continue
         value = evidence[key]
-        if key.endswith("Bytes") or key.endswith("Spilled"):
+        if key.endswith("Bytes") or key.endswith("Spilled") or key == "avgFileSize":
             rendered = fmt_bytes(value)
         elif key.endswith("Ms"):
             rendered = fmt_ms(value)
-        elif key in ("records", "medianRecords", "maxScanRows", "maxJoinRows", "partitions"):
+        elif key in ("records", "medianRecords", "maxScanRows", "maxJoinRows", "partitions",
+                     "maxInputRecords", "medianInputRecords", "upstreamTasks", "executorCount",
+                     "maxExecutors", "jobCount", "stageCount", "files", "taskCount"):
             rendered = fmt_num(value)
-        elif key in ("recordsRatio", "durationRatio", "maxShare", "sizeRatio", "maxRecordsRatio"):
+        elif key in ("recordsRatio", "durationRatio", "maxShare", "sizeRatio", "maxRecordsRatio",
+                     "inputRatio", "inputShare", "fetchRatio", "remoteReqsRatio"):
             rendered = fmt_ratio(value)
         elif key in ("distinct", "partialAggregation"):
             rendered = str(bool(value)).lower()
@@ -138,6 +162,72 @@ def render_markdown(result: dict[str, Any], *,
     else:
         lines.append("未发现明显的数据倾斜、spill 或调度异常。")
     lines.append("")
+
+    cause_findings = [f for f in findings if f.get("type") in CAUSE_TYPES]
+    if cause_findings:
+        lines.extend(["## Stage 慢因判定", "", "| Stage | 慢因 | 结论 | 证据 |", "|---|---|---|---|"])
+        for finding in cause_findings:
+            evidence = finding.get("evidence") or {}
+            stage_value = evidence.get("stageId")
+            if stage_value is None and isinstance(evidence.get("stages"), list):
+                ids = []
+                for item in evidence["stages"]:
+                    if isinstance(item, dict):
+                        ids.append(f"{item.get('stageId')}.{item.get('attemptId')}")
+                    else:
+                        ids.append(str(item))
+                stage_value = ", ".join(ids) or "—"
+            lines.append(
+                "| {stage} | {type} | {title} | {evidence} |".format(
+                    stage=stage_value or "—",
+                    type=finding.get("type"),
+                    title=str(finding.get("title", "")).replace("|", "\\|"),
+                    evidence=format_evidence(evidence).replace("|", "\\|"),
+                )
+            )
+        lines.append("")
+
+    executor_info = result.get("executors") or {}
+    if executor_info:
+        lines.extend(["## Executor 与并行度", ""])
+        lines.append(
+            f"- 观测 executor 数：{fmt_num(executor_info.get('observedCount'))}；"
+            f"active：{fmt_num(executor_info.get('activeCount'))}；"
+            f"任务中出现：{fmt_num(executor_info.get('taskExecutorCount'))}；"
+            f"上限：{fmt_num(executor_info.get('maxExecutors'))}；"
+            f"接近上限：{executor_info.get('atMax')}"
+        )
+        per_executor = executor_info.get("perExecutor") or []
+        if per_executor:
+            lines.extend(["", "| executor | host | tasks | duration | gc |", "|---|---|---|---|---|"])
+            for item in per_executor[:10]:
+                lines.append(
+                    f"| {item.get('executorId')} | {item.get('host') or '—'} | "
+                    f"{fmt_num(item.get('tasks'))} | {fmt_ms(item.get('durationMs'))} | {fmt_ms(item.get('gcMs'))} |"
+                )
+        lines.append("")
+
+    stage_to_nodes = plan.get("stageToNodes") or {}
+    if stage_to_nodes:
+        lines.extend(["## Stage → SQL 计划", "", "| Stage | 计划节点 |", "|---|---|"])
+        for stage_id in sorted(stage_to_nodes):
+            nodes = ", ".join(str(n).replace("|", "\\|") for n in stage_to_nodes[stage_id])
+            lines.append(f"| {stage_id} | {nodes} |")
+        if plan.get("exchangeKeys"):
+            lines.append("")
+            lines.append("- Exchange keys：" + "；".join(f"`{k}`" for k in plan["exchangeKeys"][:10]))
+        lines.append("")
+
+    scan_layout = plan.get("scanLayout") or []
+    if scan_layout:
+        lines.extend(["## 扫描与文件布局", "", "| 表 | files | 平均文件 | rows | scan | 小文件 |", "|---|---|---|---|---|---|"])
+        for item in scan_layout:
+            table = str(item.get("table") or "—").replace("|", "\\|")
+            lines.append(
+                f"| {table} | {fmt_num(item.get('files'))} | {fmt_bytes(item.get('avgFileSize'))} | "
+                f"{fmt_num(item.get('rows'))} | {fmt_ms(item.get('scanMs'))} | {item.get('smallFiles')} |"
+            )
+        lines.append("")
 
     lines.extend(["## 执行时间线", ""])
     if stages:
@@ -250,6 +340,8 @@ def render_markdown(result: dict[str, Any], *,
         ("auto broadcast threshold", fmt_bytes(config.get("autoBroadcastJoinThresholdBytes"))),
         ("dynamic allocation", config.get("dynamicAllocationEnabled")),
         ("minExecutors", config.get("minExecutors")),
+        ("maxExecutors", config.get("maxExecutors")),
+        ("executor cores", config.get("executorCores")),
         ("executor idle timeout", config.get("executorIdleTimeoutSec")),
         ("event log", config.get("eventLogEnabled")),
     ]
@@ -263,7 +355,25 @@ def render_markdown(result: dict[str, Any], *,
             lines.append(f"{index}. **{item.get('title')}**：{item.get('reason')}")
             lines.append(f"   - 预期：{item.get('expectedEffect')}")
             lines.append(f"   - 风险：{item.get('risk')}")
+            if item.get("constraints"):
+                lines.append(f"   - 约束：{item.get('constraints')}")
         lines.append("")
+
+    if any(f.get("type") in ("data_skew", "map_side_skew", "distinct_skew_risk") for f in findings):
+        lines.extend([
+            "## 需要验证的 key 分布",
+            "",
+            "```sql",
+            "SELECT key, count(*) AS cnt",
+            "FROM table_name",
+            "GROUP BY key",
+            "ORDER BY cnt DESC",
+            "LIMIT 20;",
+            "",
+            "SELECT count(*) FROM table_name WHERE key IS NULL;",
+            "```",
+            "",
+        ])
 
     if log_summary:
         lines.extend(["## 运行日志摘要", ""])

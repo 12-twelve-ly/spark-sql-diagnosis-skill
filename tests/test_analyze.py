@@ -4,7 +4,9 @@ from __future__ import annotations
 import sys
 import tempfile
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 
@@ -15,7 +17,9 @@ from spark_ui import resolve_endpoint  # noqa: E402
 
 def make_task(index: int, duration: float, records: float, read_bytes: float,
               deserialize: float = 0, launch: str | None = None,
-              executor: str = "1", host: str = "worker-1") -> dict:
+              executor: str = "1", host: str = "worker-1",
+              input_records: float = 0, input_bytes: float = 0,
+              fetch_wait: float = 0, remote_reqs: float = 0) -> dict:
     return {
         "taskId": 100 + index,
         "index": index,
@@ -33,9 +37,11 @@ def make_task(index: int, duration: float, records: float, read_bytes: float,
                 "recordsRead": records,
                 "remoteBytesRead": read_bytes // 2,
                 "localBytesRead": read_bytes - read_bytes // 2,
+                "fetchWaitTime": fetch_wait,
+                "remoteReqsDuration": remote_reqs,
             },
             "shuffleWriteMetrics": {"bytesWritten": 0, "recordsWritten": 0},
-            "inputMetrics": {"bytesRead": 0, "recordsRead": 0},
+            "inputMetrics": {"bytesRead": input_bytes, "recordsRead": input_records},
             "outputMetrics": {"bytesWritten": 0, "recordsWritten": 0},
             "memoryBytesSpilled": 0,
             "diskBytesSpilled": 0,
@@ -96,18 +102,29 @@ def make_sql(exec_id: int, description: str, nodes: list[dict], plan_text: str,
     }
 
 
-def make_context(sql: dict, stages: list[dict], task_lists: dict[int, list[dict]],
-                 props: list[list[str]] | None = None) -> dict:
+def make_context(sql: dict, stages: list[dict], task_lists: dict[Any, list[dict]],
+                 props: list[list[str]] | None = None, *,
+                 stage_attempts: list[dict] | None = None,
+                 jobs: list[dict] | None = None,
+                 executors: list[dict] | None = None) -> dict:
     return {
         "app_id": "application_1_2",
         "sql": sql,
-        "jobs": [{"jobId": 25, "stageIds": [s["stageId"] for s in stages]}],
+        "jobs": jobs if jobs is not None else [
+            {"jobId": 25, "stageIds": [s["stageId"] for s in stages]}
+        ],
         "stages": stages,
+        "stage_attempts": stage_attempts if stage_attempts is not None else stages,
         "task_lists": task_lists,
         "summaries": {},
         "environment": {"sparkProperties": props or []},
-        "executors": [],
+        "executors": executors or [],
     }
+
+
+def launch_time(offset_ms: int) -> str:
+    dt = datetime(2026, 11, 2, 10, 0, 0, tzinfo=timezone.utc) + timedelta(milliseconds=offset_ms)
+    return dt.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "GMT"
 
 
 class AnalyzeTests(unittest.TestCase):
@@ -155,7 +172,10 @@ class AnalyzeTests(unittest.TestCase):
                 make_node(20, "Scan parquet spark_catalog.test.dim", {"number of output rows": "3,000,000"}),
                 make_node(9, "Exchange", {"number of partitions": "40", "shuffle bytes written": "3.8 MiB",
                                           "shuffle records written": "23,000,000"}),
-                make_node(11, "SortMergeJoin", {"number of output rows": "20,000,000"}),
+                make_node(11, "SortMergeJoin", {
+                    "number of output rows": "20,000,000",
+                    "duration": "3.0 s (1.0 s, 1.0 s, 3.0 s (stage 37.0: task 67))",
+                }),
                 make_node(8, "Sort", {"spill size": "192.0 MiB", "peak memory": "224.0 MiB"}),
                 make_node(4, "HashAggregate", {"number of output rows": "40", "spill size": "0.0 B"}),
             ],
@@ -182,6 +202,8 @@ class AnalyzeTests(unittest.TestCase):
         self.assertIn("cold_start", types)
         self.assertIn("aqe_threshold_miss", types)
         self.assertTrue(result["plan"]["sortMergeJoin"])
+        self.assertIn(37, result["plan"]["stageToNodes"])
+        self.assertTrue(any("SortMergeJoin" in node for node in result["plan"]["stageToNodes"][37]))
 
     def test_count_distinct_is_balanced(self) -> None:
         tasks = [make_task(i, 66, 97_250, 855_000) for i in range(40)]
@@ -263,6 +285,214 @@ class AnalyzeTests(unittest.TestCase):
         self.assertNotIn("data_skew", types)
         self.assertIn("scheduling", types)
         self.assertIn("over_partitioning", types)
+
+    def test_parallelism_cap(self) -> None:
+        tasks = [
+            make_task(i, 100, 1000, 10_000, launch=launch_time(i * 100), executor=str(i % 4))
+            for i in range(100)
+        ]
+        stage = make_stage(
+            60, tasks,
+            "2026-11-02T10:00:00.000GMT",
+            "2026-11-02T10:00:20.000GMT",
+        )
+        stage["numTasks"] = 100
+        sql = make_sql(
+            200, "SELECT count(*) FROM t",
+            [make_node(1, "Scan parquet t", {"number of output rows": "100,000"})],
+            "Scan parquet t",
+            20_000,
+        )
+        props = [
+            ["spark.dynamicAllocation.enabled", "true"],
+            ["spark.dynamicAllocation.maxExecutors", "4"],
+        ]
+        executors = [{"id": str(i)} for i in range(4)]
+        result = analyze_execution(make_context(sql, [stage], {60: tasks}, props, executors=executors))
+        types = {finding["type"] for finding in result["findings"]}
+        self.assertIn("parallelism_cap", types)
+        self.assertNotIn("data_skew", types)
+
+    def test_resource_shortage(self) -> None:
+        tasks = [
+            make_task(i, 100, 1000, 10_000, launch=launch_time(i * 100), executor=str(i % 4))
+            for i in range(100)
+        ]
+        stage = make_stage(
+            60, tasks,
+            "2026-11-02T10:00:00.000GMT",
+            "2026-11-02T10:00:20.000GMT",
+        )
+        stage["numTasks"] = 100
+        sql = make_sql(
+            201, "SELECT count(*) FROM t",
+            [make_node(1, "Scan parquet t", {"number of output rows": "100,000"})],
+            "Scan parquet t",
+            20_000,
+        )
+        props = [
+            ["spark.dynamicAllocation.enabled", "true"],
+            ["spark.dynamicAllocation.maxExecutors", "16"],
+        ]
+        executors = [{"id": str(i)} for i in range(4)]
+        result = analyze_execution(make_context(sql, [stage], {60: tasks}, props, executors=executors))
+        types = {finding["type"] for finding in result["findings"]}
+        self.assertIn("resource_shortage", types)
+        self.assertNotIn("data_skew", types)
+
+    def test_map_side_skew(self) -> None:
+        tasks = [
+            make_task(0, 9000, 9_000_000, 0, input_records=9_000_000, input_bytes=900_000_000),
+            make_task(1, 500, 500_000, 0, input_records=500_000, input_bytes=50_000_000),
+            make_task(2, 500, 500_000, 0, input_records=500_000, input_bytes=50_000_000),
+        ]
+        stage = make_stage(
+            61, tasks,
+            "2026-11-02T10:00:00.000GMT",
+            "2026-11-02T10:00:10.000GMT",
+        )
+        stage["numTasks"] = 3
+        stage["inputRecords"] = 10_000_000
+        stage["inputBytes"] = 1_000_000_000
+        stage["shuffleReadRecords"] = 0
+        sql = make_sql(
+            202, "SELECT count(*) FROM t",
+            [make_node(1, "Scan parquet t", {"number of output rows": "10,000,000"})],
+            "Scan parquet t",
+            10_000,
+        )
+        result = analyze_execution(make_context(sql, [stage], {61: tasks}))
+        types = {finding["type"] for finding in result["findings"]}
+        self.assertIn("map_side_skew", types)
+        self.assertNotIn("data_skew", types)
+
+    def test_shuffle_fetch_slow(self) -> None:
+        tasks = [
+            make_task(i, 1000, 10_000, 1_000_000, fetch_wait=400)
+            for i in range(10)
+        ]
+        stage = make_stage(
+            64, tasks,
+            "2026-11-02T10:00:00.000GMT",
+            "2026-11-02T10:00:10.000GMT",
+            read_records=100_000,
+            read_bytes=10_000_000,
+        )
+        sql = make_sql(
+            207, "SELECT count(*) FROM t",
+            [make_node(1, "Scan parquet t", {"number of output rows": "10,000,000"})],
+            "Scan parquet t",
+            10_000,
+        )
+        result = analyze_execution(make_context(sql, [stage], {64: tasks}))
+        types = {finding["type"] for finding in result["findings"]}
+        self.assertIn("shuffle_fetch_slow", types)
+        self.assertNotIn("data_skew", types)
+
+    def test_small_files_scan(self) -> None:
+        tasks = [make_task(i, 500, 100_000, 0, input_records=100_000) for i in range(2)]
+        stage = make_stage(
+            62, tasks,
+            "2026-11-02T10:00:00.000GMT",
+            "2026-11-02T10:00:01.000GMT",
+        )
+        sql = make_sql(
+            203, "SELECT count(*) FROM t",
+            [
+                make_node(1, "Scan parquet t", {
+                    "number of files read": "500",
+                    "size of files read": "5 GiB",
+                    "number of output rows": "100,000,000",
+                })
+            ],
+            "Scan parquet t\nPartitionFilters: []\nPushedFilters: []",
+            1_000,
+        )
+        result = analyze_execution(make_context(sql, [stage], {62: tasks}))
+        types = {finding["type"] for finding in result["findings"]}
+        self.assertIn("small_files_scan", types)
+        self.assertIn("predicate_pruning", types)
+
+    def test_stage_retry(self) -> None:
+        task = make_task(0, 100, 1000, 1000)
+        failed = make_stage(
+            63, [task],
+            "2026-11-02T10:00:00.000GMT",
+            "2026-11-02T10:00:01.000GMT",
+        )
+        failed["attemptId"] = 0
+        failed["status"] = "FAILED"
+        failed["numFailedTasks"] = 2
+        ok = make_stage(
+            63, [task],
+            "2026-11-02T10:00:02.000GMT",
+            "2026-11-02T10:00:03.000GMT",
+        )
+        ok["attemptId"] = 1
+        ok["status"] = "COMPLETE"
+        sql = make_sql(
+            204, "SELECT count(*) FROM t",
+            [make_node(1, "Scan parquet t", {"number of output rows": "1000"})],
+            "Scan parquet t",
+            3_000,
+        )
+        context = make_context(
+            sql, [ok], {(63, 0): [task], (63, 1): [task]},
+            stage_attempts=[failed, ok],
+        )
+        result = analyze_execution(context)
+        types = {finding["type"] for finding in result["findings"]}
+        self.assertIn("stage_retry", types)
+
+    def test_window_skew_risk(self) -> None:
+        tasks = [make_task(i, 149, 275_000, 1_436_324) for i in range(39)]
+        tasks.append(make_task(39, 3136, 12_275_975, 4_077_740))
+        stage = make_stage(
+            50, tasks,
+            "2026-11-02T10:00:00.000GMT",
+            "2026-11-02T10:00:04.000GMT",
+            read_records=23_000_000,
+            read_bytes=60_000_000,
+        )
+        sql = make_sql(
+            205, "SELECT item_id, ROW_NUMBER() OVER (PARTITION BY item_id ORDER BY amount DESC) FROM t",
+            [
+                make_node(1, "Scan parquet t", {"number of output rows": "20,000,000"}),
+                make_node(2, "Window", {
+                    "duration": "3.0 s (1.0 s, 1.0 s, 3.0 s (stage 50.0: task 139))",
+                }),
+            ],
+            "Window\nScan parquet t",
+            4_000,
+        )
+        result = analyze_execution(make_context(sql, [stage], {50: tasks}))
+        types = {finding["type"] for finding in result["findings"]}
+        self.assertIn("data_skew", types)
+        self.assertIn("window_skew_risk", types)
+        self.assertIn(50, result["plan"]["stageToNodes"])
+
+    def test_distinct_skew_risk(self) -> None:
+        tasks = [make_task(i, 66, 97_250, 855_000) for i in range(40)]
+        stage = make_stage(
+            70, tasks,
+            "2026-11-02T10:00:00.000GMT",
+            "2026-11-02T10:00:02.000GMT",
+            read_records=3_892_616,
+            read_bytes=34_269_538,
+        )
+        sql = make_sql(
+            206, "SELECT item_id, count(DISTINCT buyer_id) FROM t GROUP BY item_id",
+            [
+                make_node(1, "Scan parquet t", {"number of output rows": "10,000,000"}),
+                make_node(2, "HashAggregate", {"number of output rows": "2,092,847"}),
+            ],
+            "HashAggregate keys [item_id] Functions [count(distinct buyer_id)]",
+            2_000,
+        )
+        result = analyze_execution(make_context(sql, [stage], {70: tasks}))
+        types = {finding["type"] for finding in result["findings"]}
+        self.assertIn("distinct_skew_risk", types)
+        self.assertNotIn("distinct_skew_resistant", types)
 
     def test_parse_log_extracts_app_ui_stage_and_stats(self) -> None:
         log_text = """

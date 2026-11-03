@@ -102,6 +102,10 @@ python scripts/spark_diagnose.py \
 - **假长尾**：task 记录数正常，但 `executorDeserializeTime` 很高，通常是冷 executor；
 - **spill**：`memoryBytesSpilled` / `diskBytesSpilled`，以及计划节点的 `spill size`；
 - **计划节点**：Scan、Exchange、Join、Aggregate 的 output rows / shuffle bytes / duration；
+- **慢因分类**：倾斜、map 端倾斜、单 task 过重、shuffle fetch、并行度/资源、调度、重试；
+- **Executor/并行度**：executor 数、maxExecutors、task launch 间隔；
+- **Stage → SQL 计划**：stage 对应的 Exchange/Join/Aggregate 节点；
+- **扫描布局**：文件数、平均文件大小、分区/谓词裁剪；
 - **配置**：AQE、skewJoin 阈值、shuffle 分区数、广播阈值、动态分配。
 
 ### 5. 写最终报告
@@ -116,13 +120,16 @@ python scripts/spark_diagnose.py \
 报告结构：
 
 1. 结论先行（按影响排序）；
-2. 执行概览与时间线；
-3. 倾斜/长尾证据表；
-4. SQL 计划映射；
-5. 配置与风险；
-6. 建议；
-7. 证据来源与局限；
-8. 仍需外部验证的问题。
+2. Stage 慢因判定（倾斜 / map 端 / 单 task 过重 / fetch / 并行度 / 资源 / 调度 / 重试）；
+3. Executor 与并行度；
+4. 执行概览与时间线；
+5. 倾斜/长尾证据表；
+6. Stage → SQL 计划映射；
+7. 扫描与文件布局；
+8. 配置与风险；
+9. 建议（带适用条件和约束）；
+10. 证据来源与局限；
+11. 仍需外部验证的问题。
 
 ## 关键判断规则
 
@@ -151,6 +158,26 @@ python scripts/spark_diagnose.py \
 
 8. **join 输出行数明显大于输入行数时，才怀疑膨胀。**
    输出行数等于事实表行数时，问题通常是分布，不是重复 key。
+
+9. **慢不等于倾斜。**
+   先分五类：倾斜、map 端倾斜、单 task 过重、shuffle fetch、并行度/资源；
+   都排除后，再看调度/冷启动和 stage 重试。
+
+10. **区分 executor 上限和队列资源不足。**
+    task 均衡但 launch 间隔大：executor 数接近 `maxExecutors` 是上限问题；
+    低于上限或申请不到资源，是队列/集群资源问题。
+
+11. **map 端倾斜通常不是 key 热点。**
+    常见原因是不可切分文件、大量小文件、异常宽记录；解决方向是合并文件、
+    改可切分格式、repartition，而不是加盐。
+
+12. **广播和加盐都有约束。**
+    广播要看 join 类型和小表内存；加盐要膨胀另一侧，通常只对少量 hot key 值得；
+    group by 两阶段聚合的盐值常用 50–100，纯 `rand()` 会把所有 key 打散。
+
+13. **用 stage id 把慢 stage 映射回计划节点。**
+    计划 metrics 里的 `(stage X.Y: task N)` 可以直接建立 stage → 节点；
+    报告要写“Stage 37 → SortMergeJoin / Exchange(item_id)”，而不是只给 stage 号。
 
 ## 边界
 

@@ -98,3 +98,47 @@
 - Spark REST：`2026-11-02T08:06:50.516GMT`；
 - Kyuubi 日志：`2026-11-02 16:06:50.434`，通常是本地时区（本项目常见 UTC+8）；
 - 不要把日志本地时间直接当 GMT 去匹配 `/sql` 的 `submissionTime`。
+
+## Executor 与调度
+
+`/executors` 主要字段：
+
+- `id`、`hostPort`
+- `totalCores`、`maxTasks`
+- `activeTasks`、`completedTasks`、`failedTasks`
+- `totalDuration`、`totalGCTime`、`memoryUsed`、`maxMemory`
+
+注意：开了动态分配后，空闲 executor 可能已经被释放，`/executors` 只剩 driver；
+此时用 task 的 `executorId` / `host` 还原任务实际跑在哪些 executor 上。
+
+task 的 `launchTime - stage.submissionTime` 是启动延迟；
+stage 墙钟减去最长 task 是调度空档。
+
+## Stage attempt
+
+`/stages` 会返回同一 `stageId` 的多个 attempt：
+
+- `stageId` + `attemptId` 才是唯一键；
+- `status` 可能是 `COMPLETE`、`FAILED`、`KILLED`；
+- `numFailedTasks`、`numKilledTasks` 用于识别重试；
+- task list 要按 `(stageId, attemptId)` 取，不能只按 stageId 覆盖。
+
+## 其他慢因字段
+
+- `fetchWaitTime`：等待 shuffle 数据的时间；
+- `remoteReqsDuration`：远程 block 请求耗时；
+- `schedulerDelay`：task 调度延迟；
+- `executorDeserializeTime`：反序列化/类加载，冷 executor 常见；
+- `memoryBytesSpilled` / `diskBytesSpilled`：spill；
+- `jvmGcTime`：GC 时间。
+
+## 计划节点的 stage 信息
+
+SQL 页面 metrics 的字符串里经常带：
+
+```text
+3.2 s (1.5 s, 1.7 s, 1.7 s (stage 32.0: task 32))
+```
+
+用正则 `stage (\d+)\.(\d+)` 可以提取 stage id，建立
+`stage → 计划节点` 的映射。多个 stage 可能映射到同一个 join/aggregate。

@@ -354,17 +354,26 @@ class SparkClient:
         stage_ids = sorted(set(stage_ids))
 
         all_stages = self.get_json(f"/applications/{app_id}/stages", allow_404=True) or []
-        stage_map = {s.get("stageId"): s for s in all_stages if s.get("stageId") in stage_ids}
+        stage_attempts = [s for s in all_stages if s.get("stageId") in stage_ids]
         for stage_id in stage_ids:
-            if stage_id not in stage_map:
+            if not any(s.get("stageId") == stage_id for s in stage_attempts):
                 detail = self.get_json(f"/applications/{app_id}/stages/{stage_id}/0", allow_404=True)
                 if detail:
-                    stage_map[stage_id] = detail
-        stages = list(stage_map.values())
+                    stage_attempts.append(detail)
 
-        task_lists: dict[int, list[dict[str, Any]]] = {}
-        summaries: dict[int, dict[str, Any]] = {}
-        for stage in stages:
+        # 同一 stageId 可能有多 attempt；全部保留，方便识别失败重试
+        deduped: dict[tuple[Any, Any], dict[str, Any]] = {}
+        for stage in stage_attempts:
+            key = (stage.get("stageId"), stage.get("attemptId", 0))
+            deduped[key] = stage
+        stage_attempts = sorted(
+            deduped.values(),
+            key=lambda s: (s.get("stageId") or 0, s.get("attemptId") or 0),
+        )
+
+        task_lists: dict[Any, list[dict[str, Any]]] = {}
+        summaries: dict[Any, dict[str, Any]] = {}
+        for stage in stage_attempts:
             stage_id = stage.get("stageId")
             attempt = stage.get("attemptId", 0)
             summary = self.get_json(
@@ -372,12 +381,36 @@ class SparkClient:
                 allow_404=True,
             )
             if summary:
-                summaries[stage_id] = summary
-            task_lists[stage_id] = self.get_all_pages(
+                summaries[(stage_id, attempt)] = summary
+                summaries[f"{stage_id}/{attempt}"] = summary
+            tasks = self.get_all_pages(
                 f"/applications/{app_id}/stages/{stage_id}/{attempt}/taskList",
                 limit=1000,
                 max_items=max_tasks,
             )
+            task_lists[(stage_id, attempt)] = tasks
+            task_lists[f"{stage_id}/{attempt}"] = tasks
+
+        selected: dict[Any, dict[str, Any]] = {}
+        for stage in stage_attempts:
+            stage_id = stage.get("stageId")
+            rank = (stage.get("status") == "COMPLETE", stage.get("attemptId", 0))
+            current = selected.get(stage_id)
+            if current is None:
+                selected[stage_id] = stage
+            else:
+                current_rank = (current.get("status") == "COMPLETE", current.get("attemptId", 0))
+                if rank > current_rank:
+                    selected[stage_id] = stage
+        stages = sorted(selected.values(), key=lambda s: s.get("stageId") or 0)
+
+        # 兼容旧调用：stageId 直接取选中 attempt 的 task list
+        for stage in stages:
+            stage_id = stage.get("stageId")
+            attempt = stage.get("attemptId", 0)
+            task_lists.setdefault(stage_id, task_lists.get(f"{stage_id}/{attempt}", []))
+            if f"{stage_id}/{attempt}" in summaries:
+                summaries.setdefault(stage_id, summaries[f"{stage_id}/{attempt}"])
 
         environment = self.get_json(f"/applications/{app_id}/environment", allow_404=True) or {}
         executors = self.get_json(f"/applications/{app_id}/executors", allow_404=True) or []
@@ -386,6 +419,7 @@ class SparkClient:
             "sql": sql,
             "jobs": jobs,
             "stages": stages,
+            "stage_attempts": stage_attempts,
             "task_lists": task_lists,
             "summaries": summaries,
             "environment": environment,
