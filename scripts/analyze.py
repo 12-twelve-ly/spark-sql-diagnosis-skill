@@ -5,8 +5,6 @@ v2 的实现在 metrics / stage_analysis / plan_analysis / runtime_analysis / fi
 """
 from __future__ import annotations
 
-import re
-import statistics
 from typing import Any
 
 from spark_ui import epoch_ms
