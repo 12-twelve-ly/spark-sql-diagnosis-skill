@@ -14,6 +14,8 @@ BYTE_UNITS = {"b": 1, "kib": 1024, "mib": 1024**2, "gib": 1024**3,
 TIME_UNITS = {"us": 0.001, "ms": 1, "s": 1000}
 
 # 可调阈值：全部是启发式，报告里会标注为“默认阈值”
+# 注意：阈值以本模块为准；analyze.py 的 re-export 是值绑定，
+# 运行期修改 analyze.PARALLELISM_MIN_TASKS 不会影响引用这些常量的子模块。
 PARALLELISM_MIN_TASKS = 50
 LAUNCH_SPREAD_MS = 2000
 HEAVY_INPUT_RECORDS = 10_000_000

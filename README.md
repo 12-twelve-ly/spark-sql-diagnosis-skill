@@ -79,7 +79,12 @@ python -m unittest discover -s tests -v
 
 - `SKILL.md`：skill 入口和诊断流程；
 - `scripts/spark_ui.py`：REST 客户端、URL/app/SQL 定位、分页；
-- `scripts/analyze.py`：task/stage/plan/config 分析与 findings；
+- `scripts/analyze.py`：分析门面，保留 `analyze_execution` 主流程并 re-export 全部公开符号；
+- `scripts/metrics.py`：数值/单位解析、分位统计、阈值常量；
+- `scripts/stage_analysis.py`：task 归一化与单 stage 慢因分析；
+- `scripts/plan_analysis.py`：执行计划解析与算子特征提取；
+- `scripts/runtime_analysis.py`：config、executor、job/stage 统计；
+- `scripts/findings.py`：finding 构造、主因选择与优化建议；
 - `scripts/report.py`：中文 Markdown 报告；
 - `scripts/spark_diagnose.py`：CLI、日志解析、UI 降级；
 - `references/`：端点、指标字段、判定阈值；
